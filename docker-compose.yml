@@ -1,0 +1,11 @@
+services:
+  analytics:
+    image: cerebrumtech/webuianalitics:latest
+    container_name: open-webui-analytics
+    restart: unless-stopped
+    ports:
+      - "3080:3080"
+    environment:
+      DATABASE_URL: sqlite:///app/data/webui.db
+    volumes:
+      - /path/to/your/webui.db:/app/data/webui.db:ro

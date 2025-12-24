@@ -3,172 +3,67 @@ import cors from 'cors'
 import Database from 'better-sqlite3'
 import pg from 'pg'
 import fs from 'fs'
-import path from 'path'
 import { fileURLToPath } from 'url'
 import { dirname, join } from 'path'
-import dotenv from 'dotenv'
-
-// Load environment variables from .env file if it exists
-dotenv.config()
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
 
 const app = express()
 
-// Database configuration
-let DATABASE_URL = process.env.DATABASE_URL
+// Database configuration from environment variable
+const DATABASE_URL = process.env.DATABASE_URL
+
+if (!DATABASE_URL) {
+  console.error('ERROR: DATABASE_URL environment variable is required')
+  console.error('Examples:')
+  console.error('  SQLite:     DATABASE_URL=sqlite:///app/data/webui.db')
+  console.error('  PostgreSQL: DATABASE_URL=postgresql://user:pass@host:5432/dbname')
+  process.exit(1)
+}
+
 let db
 let isPostgreSQL = false
-let setupMode = false
 
-// Check if we need to run setup
-if (!DATABASE_URL) {
-  const defaultDbPath = join(__dirname, 'webui.db')
-  if (!fs.existsSync(defaultDbPath)) {
-    setupMode = true
-    console.log('No database configuration found. Starting in setup mode.')
-  } else {
-    DATABASE_URL = `sqlite:///${defaultDbPath}`
+if (DATABASE_URL.startsWith('postgresql://') || DATABASE_URL.startsWith('postgres://')) {
+  isPostgreSQL = true
+  const { Pool } = pg
+  db = new Pool({
+    connectionString: DATABASE_URL,
+  })
+  console.log('Connected to PostgreSQL database')
+} else if (DATABASE_URL.startsWith('sqlite://')) {
+  // Handle both sqlite:///path and sqlite:////path (absolute)
+  let dbPath = DATABASE_URL.replace('sqlite://', '')
+  // Remove leading slashes and determine if absolute
+  while (dbPath.startsWith('/')) {
+    dbPath = dbPath.substring(1)
   }
+  // Always treat as absolute path in container
+  dbPath = '/' + dbPath
+  
+  if (!fs.existsSync(dbPath)) {
+    console.error(`ERROR: SQLite database file not found at: ${dbPath}`)
+    console.error('Make sure to mount the database file into the container')
+    process.exit(1)
+  }
+  db = new Database(dbPath, { readonly: true })
+  console.log(`Connected to SQLite database: ${dbPath}`)
+} else {
+  console.error('ERROR: Unsupported database URL. Only SQLite and PostgreSQL are supported.')
+  process.exit(1)
 }
 
-// Initialize database if not in setup mode
-if (!setupMode) {
-  if (DATABASE_URL.startsWith('postgresql://') || DATABASE_URL.startsWith('postgres://')) {
-    isPostgreSQL = true
-    const { Pool } = pg
-    db = new Pool({
-      connectionString: DATABASE_URL,
-    })
-  } else if (DATABASE_URL.startsWith('sqlite://')) {
-    const dbPath = DATABASE_URL.replace('sqlite:///', '').replace('sqlite://', '')
-    db = new Database(dbPath, { readonly: true })
-  } else {
-    throw new Error('Unsupported database URL. Only SQLite and PostgreSQL are supported.')
-  }
-}
-
-app.use(cors({
-  origin: ['http://localhost:3001', 'http://localhost:5173'],
-  credentials: true
-}))
+app.use(cors())
 app.use(express.json())
 
-// Setup routes
-if (setupMode) {
-  app.get('/setup', (req, res) => {
-    res.json({ setupRequired: true })
-  })
-
-  app.post('/setup/test-sqlite', async (req, res) => {
-    try {
-      const { filePath } = req.body
-      
-      if (!filePath) {
-        return res.status(400).json({ error: 'File path is required' })
-      }
-      
-      // Expand ~ to home directory
-      const expandedPath = filePath.startsWith('~') 
-        ? join(process.env.HOME || process.env.USERPROFILE || '', filePath.slice(2))
-        : filePath
-      
-      if (!fs.existsSync(expandedPath)) {
-        return res.status(404).json({ error: 'File not found' })
-      }
-      
-      // Test opening the database
-      const testDb = new Database(expandedPath, { readonly: true })
-      testDb.close()
-      
-      res.json({ success: true, path: expandedPath })
-    } catch (error) {
-      res.status(400).json({ error: error.message })
-    }
-  })
-
-  app.post('/setup/configure', async (req, res) => {
-    console.log('Setup configure request received:', req.body)
-    try {
-      const { type, config } = req.body
-      
-      if (type === 'postgresql') {
-        const { host, port, database, username, password } = config
-        const connectionString = `postgresql://${username}:${encodeURIComponent(password)}@${host}:${port}/${database}`
-        
-        // Test connection
-        const { Pool } = pg
-        const testDb = new Pool({ connectionString })
-        await testDb.query('SELECT 1')
-        await testDb.end()
-        
-        // Save configuration to .env file
-        const envContent = `DATABASE_URL=${connectionString}\n`
-        fs.writeFileSync(join(__dirname, '.env'), envContent)
-        
-        res.json({ success: true, message: 'PostgreSQL configuration saved successfully' })
-      } else if (type === 'sqlite') {
-        const { filePath } = config
-        
-        if (!filePath) {
-          return res.status(400).json({ error: 'File path is required' })
-        }
-        
-        // Expand ~ to home directory
-        const expandedPath = filePath.startsWith('~') 
-          ? join(process.env.HOME || process.env.USERPROFILE || '', filePath.slice(2))
-          : filePath
-        
-        if (!fs.existsSync(expandedPath)) {
-          return res.status(400).json({ error: 'SQLite database file not found at: ' + expandedPath })
-        }
-        
-        // Test opening the database
-        const testDb = new Database(expandedPath, { readonly: true })
-        testDb.close()
-        
-        // Save configuration to .env file
-        const envContent = `DATABASE_URL=sqlite:///${expandedPath}\n`
-        fs.writeFileSync(join(__dirname, '.env'), envContent)
-        
-        res.json({ success: true, message: 'SQLite configuration saved successfully' })
-      } else {
-        res.status(400).json({ error: 'Invalid database type' })
-      }
-    } catch (error) {
-      res.status(500).json({ error: error.message })
-    }
-  })
-
-  app.post('/setup/restart', (req, res) => {
-    res.json({ success: true, message: 'Restarting server...' })
-    setTimeout(() => {
-      process.exit(0)
-    }, 1000)
-  })
-
-  // Handle API routes in setup mode
-  app.get('/api/*', (req, res) => {
-    res.status(503).json({ 
-      error: 'Database not configured. Please complete setup first.', 
-      setupRequired: true,
-      setupUrl: '/setup'
-    })
-  })
-
-  // For non-API routes in setup mode, let the frontend handle routing
-  app.get('*', (req, res) => {
-    res.status(503).json({ 
-      error: 'Database not configured. Setup required.', 
-      setupRequired: true 
-    })
-  })
+// Serve static files from dist folder in production
+const distPath = join(__dirname, 'dist')
+if (fs.existsSync(distPath)) {
+  app.use(express.static(distPath))
 }
 
-// Database query helpers (only available in non-setup mode)
-if (!setupMode) {
-
+// Database query helpers
 async function executeQuery(query, params = []) {
   if (isPostgreSQL) {
     const result = await db.query(query, params)
@@ -195,24 +90,6 @@ async function executeQuerySingle(query, params = []) {
       return stmt.get() || {}
     }
   }
-}
-
-// Convert SQLite JSON queries to PostgreSQL
-function adaptQuery(sqliteQuery) {
-  if (!isPostgreSQL) {
-    return sqliteQuery
-  }
-  
-  // Convert SQLite json_extract to PostgreSQL jsonb operators
-  let query = sqliteQuery
-    .replace(/json_extract\(([^,]+),\s*'\$\.([^']+)'\)/g, '$1->\'$2\'')
-    .replace(/json_extract\(([^,]+),\s*'\$\.([^.]+)\.([^']+)'\)/g, '$1->\'$2\'->\'$3\'')
-    .replace(/json_each\(json_extract\(([^,]+),\s*'\$\.([^']+)'\)\)/g, 'jsonb_array_elements($1->\'$2\')')
-    .replace(/json_each\(([^)]+)\)/g, 'jsonb_array_elements($1)')
-    .replace(/date\(([^,]+),\s*'unixepoch'\)/g, 'date(to_timestamp($1))')
-    .replace(/datetime\(([^,]+),\s*'unixepoch'\)/g, 'to_timestamp($1)')
-  
-  return query
 }
 
 app.get('/api/stats/overview', async (req, res) => {
@@ -576,14 +453,14 @@ app.get('/api/stats/tools', async (req, res) => {
   }
 })
 
-} // End of non-setup mode
+// SPA fallback - serve index.html for all non-API routes in production
+if (fs.existsSync(distPath)) {
+  app.get('*', (req, res) => {
+    res.sendFile(join(distPath, 'index.html'))
+  })
+}
 
-const PORT = process.env.PORT || 3001
+const PORT = process.env.PORT || 3080
 app.listen(PORT, () => {
-  if (setupMode) {
-    console.log(`Analytics API server running in setup mode on port ${PORT}`)
-    console.log(`Visit http://localhost:${PORT}/setup to configure your database`)
-  } else {
-    console.log(`Analytics API server running on port ${PORT}`)
-  }
+  console.log(`Analytics API server running on port ${PORT}`)
 })
